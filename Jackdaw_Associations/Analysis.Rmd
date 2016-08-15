@@ -1,0 +1,497 @@
+---
+title: "Jackdaw Associations"
+output: html_document
+---
+
+# Introduction
+
+The temporal data comes from Passive Integrated Transponder (PIT)-tagged jackdaws.
+The dataset is a series of timestamps (about a 4 week period, from 19th July - 16th August 2015), with corresponding birdID at 
+a feeder located in Pencoose farm, Stithians, Cornwall, UK.
+
+| timestamp |  birdID |
+|:-----------|:----------|
+| 719145756 |  01010C10D357 |
+| 719174140 |  02010C11169D | 
+
+The format of the timestamp is month/day/hour/minute/second, so 719145756 is 14:57:56
+on 19th July.
+
+**Objective**: *"To identify the underlying social network structure"*
+
+# Read and preprocess data
+
+We start by reading and preprocess the data. Specifically do the following:
+
+1. Convert `birdID` to a unique integer
+2. Convert `timestamp` (e.g 719145756) to a `timeObject` (e.g 2015-07-19 14:57:56 GMT)
+3. Convert `timeObject` (e.g 2015-07-19 14:57:56 GMT) to a `relativeTime` (e.g 53876) secs since 
+the *start* of the first recorded day (e.g 2015-07-19 00:00:00 GMT)
+
+```{r, warning=FALSE, message=FALSE}
+# Clear workspace
+rm(list = setdiff(ls(), lsf.str())) 
+
+# Load all libraries to be used in subsequent analyses
+library(mclust) # Gaussian Mixture Model
+library(network) # to draw network
+library(RColorBrewer) # color brewer colours
+
+# Read data
+data <- read.table(file="data.csv", header=T, sep=",", skip=0)
+
+# Remove prefix 01 or 02 as this only corresponds to one of the two antennas and not a
+# different bird, that is, 01010C10D357 and 02010C10D357 are the same bird 010C10D357 
+data$fullBirdID <- data$birdID
+data$birdID <- as.factor(substring(data$birdID, 3)) # 141 unique birds
+# BirdIDs are long e.g 010C10D357, let us shorten them to an integer
+uniqueBirdID <- levels(data$birdID) 
+iCnt <- 1 # counter for unique birdIDs
+for (birdID in uniqueBirdID)
+{
+    levels(data$birdID)[uniqueBirdID==birdID] = iCnt # new birdID = 1, 2, ..., 155
+    iCnt <- iCnt + 1
+}
+
+# Convert timestamp to a timeObject
+data$timeObject <- paste("0", data$timestamp, sep="") # append a "0" to start of timestamp
+data$timeObject <- strptime(data$timeObject, "%m%d%H%M%S", tz="GMT")
+
+# Convert to relative time in secs
+timeDatum <- paste("0", data$timestamp[1], sep="") # timestamp[1] = 8/5 05:30:33
+substr(timeDatum, start=5, stop=10) <- "000000" # timeDatum = 8/5 00:00:00
+timeDatum <- strptime(timeDatum, "%m%d%H%M%S", tz="GMT")
+data$relativeTime <- as.numeric(difftime(data$timeObject, timeDatum, units="secs"))
+```
+
+# Inter-visitation times
+
+To elucidate on the data's structure let's plot a histogram (on log scale) of the 
+inter-visitation times, that is, the time difference between successive bird observations 
+(given that they are different birds). We compute these differences separately on 
+two weeks chunks of data.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, fig.width=7, fig.height=7, fig.align='center'}
+N2Weeks <- ceiling(max(data$relativeTime)/60/60/24/7/2) # no. of 2 weeks
+N2Weeks <- N2Weeks - 1 # Wk1-2, Wk3-4, but for Wk5 there's only "a bit" of data
+legStr <- c() # store legend strings
+colours <- brewer.pal(n=N2Weeks, 'Set1')
+#pdf("Histogram.pdf")
+for (iWeek in seq(N2Weeks))
+{
+    # Select week data
+    startSec <- (iWeek-1)*2*7*24*60*60 # 2wks*7days*24hrs*60mins*60secs 
+    stopSec <- (iWeek)*2*7*24*60*60
+    thisData <- data[data$relativeTime >= startSec & data$relativeTime < stopSec, ]
+    delta <- c() # variable to store inter-visitation times
+    for (i in seq(from=2, to=dim(thisData)[1]))
+    {
+        if (data$birdID[i-1] != data$birdID[i]) # only compute if it's a different bird
+        {
+            thisDelta <- data$relativeTime[i] - data$relativeTime[i-1]
+            if (thisDelta < 12*60*60) # 12hrs*60mins*60s
+            {
+                delta <- c(delta, thisDelta) # it's a valid delta
+            }
+        }
+    }
+    thisHist <- hist(delta, plot=FALSE, breaks=1000)
+    if (iWeek==1)
+    {
+        plot(thisHist$density ~ thisHist$mids, log="xy", col=colours[iWeek], pch=16, 
+              xlab="log10(Inter-visitation time) (secs)", ylab="log10(Frequency)", xaxt="n", 
+             xlim=c(10, 100000), cex.lab=1.3, cex.axis=1.3, cex.main=1.3, cex.sub=1.3) # plot log scale
+    }
+    else 
+    {
+        points(thisHist$density~thisHist$mids, col=colours[iWeek], pch=16)
+    }
+    legStr <- c(legStr, paste("week", (iWeek*2)-1, '-', (iWeek*2), sep=""))
+}
+axis(side = 1, at = c(10, 100, 1000, 10000, 100000), cex.axis=1.3)
+legend("topright", legStr, bty="n", col=colours, pch=16, cex=1.5)
+#dev.off()
+```
+
+The histogram suggests that the distribution of inter-visitation times is stable over
+different weeks of data. The data is dominated by short inter-visitation periods, corresponding
+to feeding events, and then large inactivity periods. Let us visualise these feeding/gathering
+events by plotting the first week's observations, split by day.
+
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, fig.width=8, fig.height=20, fig.align='center'}
+NDays <- 7
+par(mfrow=c(NDays, 1))
+for (iDay in seq(NDays))
+{
+    startSec <- (iDay-1)*24*60*60 
+    stopSec <- (iDay)*24*60*60
+    thisData <- data[data$relativeTime >= startSec & data$relativeTime < stopSec, ]
+    plot(thisData$timeObject, rep(1, dim(thisData)[1]), type="h", 
+         main=paste("Day", iDay), xlab="Time of day", ylab="Observation", ylim=c(0, 1.05))
+}
+```
+
+# Social network identification
+
+To infer the underlying social network structure we follow the work of Psorakis et al.
+*J. R. Soc. Interface (2012)* The first day of data is used to illustrate the workflow.
+
+## 1) Cluster `relativeTime` and generate the responsibility matrix
+
+As we have seen previously, the data consists of several distinct feeding events. The first 
+step is to cluster timestamps into these separate gathering events, such that, temporally
+close observations are grouped together. Let $K$ be the total number of clusters, 
+we model each timestamp $t$ as a Gaussian Mixture Model (GMM):
+
+$$
+p(t) = \sum_{i=1}^K \pi_i \mathcal{N}(t|\mu_i, \sigma^2_i)\ \mathrm{and}\ \sum_{i=1}^K \pi_i = 1
+$$
+
+For example if we had 3 feeding events then we fit 3 Gaussian distributions with
+different mean and variance. Let us simulate this scenario to illustrate GMM fitting:
+
+$$
+p(t) = \pi_1 \mathcal{N}(t|\mu_1, \sigma^2_1) + \pi_2 \mathcal{N}(t|\mu_2, \sigma^2_2) + \pi_3 \mathcal{N}(t|\mu_3, \sigma^2_3)
+$$
+
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, fig.width=6, fig.height=14, fig.align='center'}
+par(mfrow=c(2, 1))
+# Simulate data
+N <- 100 # 50 observations per gathering event
+k <- 3 # no. of simulated events
+set.seed(101) # to reproduce results
+event1 <- rnorm(n=N, mean=1000, sd=100) # cluster 1
+event2 <- rnorm(n=N, mean=1300, sd=50) # cluster 2
+event3 <- rnorm(n=N, mean=1800, sd=200) # cluster 3
+xTrain <- c(event1, event2, event3) # concatenate data
+plot(xTrain, rep(1, N*k), type="h", ylim=c(0, 1.05), xlab="relativeTime (secs)", ylab="Observation", 
+     main="Simulated gathering events")    
+
+# Fit Gaussian Mixture Model
+fit <- Mclust(data=xTrain, G=k, modelNames="V")
+
+# Evaluate GMM and plot
+#pdf("GMM.pdf")
+xMin <- min(xTrain)
+xMax <- max(xTrain)
+xTest <- seq(xMin - 0.1*xMin, xMax + 0.1*xMax, length=(xMax - xMin)*2) # test data to evaluate GMM fit on
+pdfX <- matrix(data=NA, nrow=length(xTest), ncol=k) # prob distn function
+hist(xTrain, breaks=100, freq=F, col="grey", border="white", xlab="Relative time (secs)", 
+     ylab="Probability density", main="", cex.lab=1.3, cex.axis=1.3, cex.main=1.3, cex.sub=1.3)
+for (i in seq(k)) {
+    p <- fit$parameters$pro[i]
+    mu <- fit$parameters$mean[i]
+    sigma <- sqrt(fit$parameters$variance$sigmasq[i])
+    pdfX[, i] <- p*dnorm(x=xTest, mean=mu, sd=sigma)
+    lines(xTest, pdfX[, i], pch="", lty=2, col="blue", lwd=4)
+}
+lines(xTest, rowSums(pdfX), pch="", lty=1, lwd=4)
+#dev.off()
+```
+
+The problem is that we do not know *a priori* how many clusters our data contains. 
+Psorakis et al. developed a rigourous approach to automatically estimate this, however it
+is beyond the scope of this note. Here, instead we rely on a simple cluster validity
+metric, the BIC (Bayesian Information Criterion), and choose $K$ to be the "knee" point of
+the scree plot (recall that the ``true" number of clusters is inherently ambigouos). 
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, fig.width=6, fig.height=6, fig.align='center'}
+par(mfrow=c(1, 1))
+iDay <- 2
+startSec <- (iDay-1)*24*60*60 # 1 day x 24 hrs x 60 mins x 60 secs
+stopSec <- (iDay)*24*60*60
+thisData <- data[data$relativeTime >= startSec & data$relativeTime < stopSec, ]
+fit <- Mclust(data=thisData$relativeTime, G=2:200, modelNames="V")
+bic <- as.numeric(fit$BIC)
+#pdf("BIC.pdf")
+plot(2:200, bic, type="p", pch=19, xlab="Number of clusters", 
+     ylab="Bayesian Information Criterion (BIC)",
+     cex.lab=1.3, cex.axis=1.3, cex.main=1.3, cex.sub=1.3)
+K = 115 # chosen number of clusters
+abline(v=K, col="red", lty=2, lwd=4)
+#dev.off()
+fit <- Mclust(data=thisData$relativeTime, G=K, modelNames="V")
+```
+
+Now that we have a fitted GMM we can generate the `responsibilityMatrix`
+(observation-to-cluster matrix); a $Z \times K$
+matrix where $Z$ is the total number of observations and $K$ is the number of gathering 
+events (clusters). If observation $z$ is part of cluster $k$ then 
+`responsibilityMatrix[z, k] = 1` otherwise is zero.
+         
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+get_responsibility_matrix <- function(fit) 
+{
+        # Initialise variables
+        NObs <- length(fit$classification) # total no. of observations
+        responsibilityMatrix = matrix(data=0, nrow=NObs, ncol=fit$G)
+        # Fill responsibilityMatrix with either 0 or 1
+        for (iRow in seq(NObs)) 
+        {
+                responsibilityMatrix[iRow, fit$classification[iRow]] <- 1
+        }
+    return(responsibilityMatrix)
+}
+
+responsibilityMatrix <- get_responsibility_matrix(fit)
+```
+
+## 2) Convert responsibility matrix to bird-to-cluster matrix
+
+Multiple observations $z$ correspond to the same bird. The next step is to collapse
+the responsibility matrix $Z \times K$ to a bird-to-cluster matrix `birdMatrix`;a $N \times K$, where $N$ is
+the number of *unique* `birdID` by summing the occurences of the same bird across the 
+same gathering event.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+responsibility_matrix_to_bird_matrix <- function(responsibilityMatrix, birdID)
+{
+    # Initialise variables
+    NBirds <- length(levels(birdID)) # no. of unique birds
+    K <- dim(responsibilityMatrix)[2] # no. of gathering events
+    birdMatrix <- matrix(data=0, nrow=NBirds, ncol=K)
+    uniqueBirds <- levels(birdID)
+    rownames(birdMatrix) <- uniqueBirds
+    # Loop through every unique bird
+    for (iBird in seq(NBirds)) 
+    {
+        # Extract responsibility matrix for this birdID
+        thisBird <- responsibilityMatrix[birdID==uniqueBirds[iBird], ]
+        if (class(thisBird)=="numeric") # apply() fails if iBird only has one row
+        {
+            birdMatrix[iBird, ] <- thisBird
+        } else
+        {
+            birdMatrix[iBird, ] <- apply(thisBird, 2, sum)  
+        }
+    }
+    return(birdMatrix)
+}
+
+birdMatrix <- responsibility_matrix_to_bird_matrix(responsibilityMatrix, thisData$birdID)
+```
+
+## 3) Convert bird-to-cluster matrix to adjacency matrix
+
+Last step is to convert the bird-to-cluster matrix $N \times K$ to the `adjacencyMatrix`
+$N \times N$. `adjacencyMatrix[i, j]` is defined as the co-occurence of birds $i$ and $j$,
+that is, the number of times they were recorded in the same feeding event.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+bird_matrix_to_adjacency_matrix <- function(birdMatrix)
+{
+    # Initialise variables
+    NBirds <- dim(birdMatrix)[1]
+    adjacencyMatrix <- matrix(data=0, nrow=NBirds, ncol=NBirds)
+    rownames(adjacencyMatrix) <- rownames(birdMatrix)
+    colnames(adjacencyMatrix) <- rownames(birdMatrix)
+    for (iBird1 in seq(NBirds))
+    {
+        for (iBird2 in seq(NBirds))
+        {
+            if (iBird1 == iBird2)
+            {
+                # If it's the same bird then no link
+                adjacencyMatrix[iBird1, iBird2] <- 0
+            } else
+            {
+                # Count the number of co-occurences for the same feeding event
+                thisPair <- birdMatrix[c(iBird1, iBird2), ]
+                adjacencyMatrix[iBird1, iBird2] <- sum(apply(thisPair, 2, min))
+                adjacencyMatrix[iBird2, iBird1] <- adjacencyMatrix[iBird1, iBird2] 
+            }
+        }
+    }
+    return(adjacencyMatrix)
+}
+
+adjacencyMatrix <- bird_matrix_to_adjacency_matrix(birdMatrix)
+```
+
+## 4) Display network
+
+The identified adjacency matrix may contain spurious connections, because two birds 
+may have been at the feeder at the same time by coincidence rather than because they 
+are socially affiliated (especially during peak feeding events). Psorakis et al.
+derived a rigorous statistical test to define whether a connection is spurious or not, 
+however it is beyond the scope of this note. Instead we use a simple cut-off and remove
+connections which are low compared to the rest.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, fig.width=8, fig.height=8, fig.align='center'}
+# Retrieve connection weights from the adjacency matrix
+N <- dim(adjacencyMatrix)[1]
+linkWeight <- matrix(data=adjacencyMatrix, ncol=1, nrow=N*N) #
+linkWeight <- linkWeight[linkWeight!=0] # remove weights which are already zero
+
+# Plot histogram of weights and find the mode
+hist(linkWeight, col="grey", border="white", breaks=100, freq=F, 
+     xlab="Adjacency matrix weight", ylab="Frequency", main="")
+pdfWeights <- density(linkWeight) # fit probability density function (pdf)
+lines(pdfWeights) # plot fitted pdf
+modeWeight <- pdfWeights$x[which.max(pdfWeights$y)] # find the mode
+abline(v=modeWeight, col="red", lty=2)
+
+# Set any connection less than the mode to zero and plot network
+myAdjacencyMatrix <- adjacencyMatrix
+myAdjacencyMatrix[myAdjacencyMatrix <= modeWeight] <- 0
+thisNet = network(myAdjacencyMatrix, directed=FALSE, matrix.type="adjacency")
+plot(thisNet, displaylabels=TRUE, label.cex=0.5, displayisolates=F, edge.lwd=myAdjacencyMatrix/10)
+```
+
+# Overall social network
+
+Let us now repeat the social network identification workflow for all days in our dataset
+and then combine all the adjacency matrices together.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, fig.width=8, fig.height=8, fig.align='center'}
+NDays <- ceiling(max(data$relativeTime)/60/60/24) # total no. of days in our dataset
+NBirds <- length(levels(data$birdID)) # no. of unique birds
+adjacencyMatrix <- array(data=0, dim=c(NBirds, NBirds, NDays)) # an adjacency matrix for every day
+# Loop through all days
+for (iDay in seq(NDays))
+{
+    startSec <- (iDay-1)*24*60*60 
+    stopSec <- (iDay)*24*60*60
+    thisData <- data[data$relativeTime >= startSec & data$relativeTime < stopSec, ]
+    if (dim(thisData)[1] > 10) # don't try to cluster if only a handful of times are available 
+    {
+        fit <- Mclust(data=thisData$relativeTime, G=seq(from=2, to=200, by=2), modelNames="V")
+        responsibilityMatrix <- get_responsibility_matrix(fit)
+        birdMatrix <- responsibility_matrix_to_bird_matrix(responsibilityMatrix, thisData$birdID)
+        adjacencyMatrix[, , iDay] <- bird_matrix_to_adjacency_matrix(birdMatrix)   
+    }
+}
+
+# Combine adjacency matrix from every day
+overallAdjacencyMatrix <- apply(adjacencyMatrix, c(1, 2), sum)
+N <- dim(overallAdjacencyMatrix)[1]
+linkWeight <- matrix(data=overallAdjacencyMatrix, ncol=1, nrow=N*N) #
+linkWeight <- linkWeight[linkWeight!=0] # remove weights which are already zero
+
+# Plot histogram of weights and find the mode
+hist(linkWeight, col="grey", border="white", breaks=100, freq=F, 
+     xlab="Adjacency matrix weight", ylab="Frequency", main="")
+pdfWeights <- density(linkWeight) # fit probability density function (pdf)
+lines(pdfWeights) # plot fitted pdf
+modeWeight <- pdfWeights$x[which.max(pdfWeights$y)] # find the mode
+abline(v=modeWeight, col="red", lty=2)
+```
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, fig.width=11, fig.height=11, fig.align='center'}
+# Set any connection less than the mode to zero and plot network
+myAdjacencyMatrix <- overallAdjacencyMatrix
+myAdjacencyMatrix[myAdjacencyMatrix <= modeWeight] <- 0
+thisNet = network(myAdjacencyMatrix, directed=FALSE, matrix.type="adjacency")
+plot(thisNet, displaylabels=TRUE, label.cex=0.5, displayisolates=F, edge.lwd=myAdjacencyMatrix/10)
+```
+
+For some of these birds we have information about which nest boxes they occupy. We can 
+therefore plot the above social network spatially by placing the nodes at the known nest boxes
+co-ordinates (note this is a reduced social network as we only have this info for a subset
+of all RFID-tagged birds)
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, fig.width=11, fig.height=11, fig.align='center'}
+library(OpenStreetMap)
+library(igraph)
+
+#INPUTS
+adj_mat<-myAdjacencyMatrix
+indivs<-paste0("01", uniqueBirdID) # Append "01" to match IDs in "2015_PEN_box_owners" (it's antennae ID)
+dimnames(adj_mat)<-list(indivs,indivs)
+box_owners<-read.csv("2015_PEN_box_owners.csv",header=TRUE)
+juvs<-read.csv("PEN2015_juvs.csv",header=TRUE)  #JUVENILE LIFE HISTORY INFORMATION
+all<-rbind(box_owners,juvs)
+
+#FIND BOX OWNERS AND THEIR OFFSPRING THAT ARE IN NETWORK
+find_foc<-which(indivs %in% as.character(all[,"RFID"]) )
+foc<-rep(1,length(indivs))
+foc[find_foc]<-2
+box_ids<-indivs[foc==2]
+
+#CLIP ADJACENCY MATRIX TO REMOVE NON-BOX INDIVIDUALS
+clipped_mats<-as.matrix(adj_mat[box_ids,box_ids])
+clipped_all<-all[which(all[,"RFID"] %in% box_ids),]
+clipped_all<-clipped_all[with(clipped_all,order(-LAT,LON)),]
+rerd<-as.numeric(match(clipped_all[,"RFID"],box_ids))
+clipped_mats<-clipped_mats[rerd,rerd]
+
+#CREATE FACTORS FOR SETTING GRAPH ATTRIBUTES
+sex_temp<-as.character(clipped_all[,"SEX"])
+sex_temp[which(is.na(sex_temp))]<-"UNK"
+clipped_all[,"SEX"]<-sex_temp
+sex_num<-factor(sex_temp,labels=c("1","2","3"))
+cols<-c("red","blue","yellow")
+age_temp<-rep(1,nrow(clipped_all))
+age_temp[which(clipped_all[,"PAIR"]==0)]<-2
+shapes<-c("circle","square")
+
+#CREATE IGRAPH OBJECT AND SET VERTEX ATTRIBUTES
+adj_mat_2<-graph.adjacency(clipped_mats,mode=c("undirected"),weighted=TRUE,diag=FALSE)
+V(adj_mat_2)$color<-cols[sex_num]
+V(adj_mat_2)$shape<-shapes[age_temp]
+
+#SET EDGE ATTRIBUTES
+E(adj_mat_2)$width<-E(adj_mat_2)$weight/40
+box_c<-lapply(split(all,all[,"BOX"]),function(x) as.vector(outer(x[,"RFID"], x[,"RFID"], paste, sep="-")))
+box_c<-as.character(unlist(box_c))  #GET ALL POSSIBLE RELATED/PAIRED EDGES
+edge_list_2<-apply(get.edgelist(adj_mat_2), 1, paste, collapse="-")
+E(adj_mat_2)$color<-ifelse(edge_list_2 %in% box_c,"green","black")
+
+#REMOVE ISOLATES (INDIVIDUALS WITH NO ASSOCIATION)
+deg_2<-degree(adj_mat_2,mode="all")
+names(deg_2)<-NULL
+inds_2<-which(as.numeric(deg_2)==0)
+removals<-as.character(V(adj_mat_2)$name[inds_2])
+removals<-c(removals,"010C109B7E","010C11BC8D")
+adj_mat_2<-delete_vertices(adj_mat_2,removals)
+clipped_all<-clipped_all[!clipped_all[,"RFID"] %in% removals,]
+coords<-as.matrix(cbind(clipped_all[,c("LAT","LON")],ind=seq(1:nrow(clipped_all))))
+
+#CALCULATE PLOT PARAMETERS
+min_window<-0.000075
+temp_lat<-as.numeric(c(max(coords[,1]),min(coords[,1])))
+temp_lon<-as.numeric(c(min(coords[,2]),max(coords[,2])))
+box_size_lat<-abs(diff(temp_lat))*(min_window/abs(diff(temp_lat)))
+box_size_lon<-abs(diff(temp_lon))*(min_window/abs(diff(temp_lon)))
+lat<-c(temp_lat[1]+box_size_lat,temp_lat[2]-box_size_lat)
+lon<-c(temp_lon[1]-box_size_lon,temp_lon[2]+box_size_lon)
+vert_size.1<-box_size_lat
+
+#JITTER VERTEX COORDINATES TO PREVENT OVERLAP AND GENERATE GRAPH LAYOUT
+jitter<-0.00005         
+alt_mat<-matrix(c(0,0,0,jitter,0,(-1*jitter),(-1*jitter),0,jitter,0),ncol=2,byrow=TRUE)
+secondary<-matrix(c(jitter,jitter,(-1*jitter),(-1*jitter),(-1*jitter),jitter,jitter,(-1*jitter)),ncol=2,byrow=TRUE)
+all_mat<-rbind(secondary,alt_mat)
+spl_co<-split(as.data.frame(coords),list(coords[,1],coords[,2]))
+spl_co<-spl_co[lapply(spl_co,nrow)>0]
+names(spl_co)<-NULL
+rect_pos<-lapply(spl_co,function(x) x[1,1:2])
+rect_df<-do.call(rbind,rect_pos)
+rect_temp<-lapply(spl_co,function(x) x[1,])
+coord_alt<-lapply(spl_co,function(x) cbind(as.matrix(x[,1:2])+all_mat[1:nrow(x),],ind=x[,"ind"]))
+coord<-do.call(rbind,coord_alt)
+coord<-coord[order(coord[,"ind"]),]
+row.names(coord)<-NULL
+coords<-as.matrix(coord[,c(2,1)])   
+
+#CREATE RECTANGLES FOR PLOT
+divergence<-box_size_lat     
+rect_1<-as.numeric(rect_df[,2])-divergence
+rect_2<-as.numeric(rect_df[,1])-divergence
+rect_3<-as.numeric(rect_df[,2])+divergence
+rect_4<-as.numeric(rect_df[,1])+divergence
+names(rect_1)<-names(rect_2)<-names(rect_3)<-names(rect_4)<-NULL
+
+#SPATIAL PLOT OF NETWORK
+#tiff("SpatialNetwork.tiff",width=40,height=40,units="mm",res=1200,pointsize=3)
+par(pty="s",usr=c(lon[1],lon[2],lat[2],lat[1]),mar=c(4,4,4,4))
+plot(lon[1]:lon[2],lat[2]:lat[1],type="n",xlim=c(lon[1],lon[2]),ylim=c(lat[2],lat[1]),xlab="Longitude",ylab="Latitude")
+#plot(pen_proj)
+legend("topright",inset=c(0,0),legend=c("Adult Female","Adult Male","Juvenile (Unknown Sex)","Related or Paired","Unrelated","Location of Feeder"),pch=c(16,16,15,NA,NA,18),lty=c(NA,NA,NA,1,1,NA),bg="white",col=c(cols,"green","black","pink"),pt.bg=c(cols,"green","black","pink"),cex=0.75,ncol=1,text.col="black",lwd=0.2)
+plot.igraph(adj_mat_2,layout=coords,vertex.label=NA,vertex.size=vert_size.1*50,rescale=FALSE,xlim=c(lon[1],lon[2]),ylim=c(lat[2],lat[1]),add=TRUE,vertex.frame.color=NA)
+rect(rect_1,rect_2,rect_3,rect_4,border="green",lwd=0.3)
+points(x=-5.1692,y=50.1989,pch=18,col="pink",cex=2) # LOCATION OF FEEDER
+#dev.off()
+```
